@@ -2,6 +2,7 @@
 using System.Windows.Forms;
 using Modbus.Device;
 using System.Net.Sockets;
+using System.Threading;
 
 namespace CTAutorun
 {
@@ -24,10 +25,12 @@ namespace CTAutorun
 
     private void ConnectApp_click(object sender, EventArgs e)
         {
-            UIauto.find_dlgs();
+            //StartModbusTcpSlave();
+            Thread test = new Thread(() => UIauto.find_dlgs());
+            test.Start();
             ConnectApp.Enabled = false;
 
-            //StartModbusTcpSlave();
+            //
             //if(Global.thread4.ThreadState == System.Threading.ThreadState.Unstarted)
             //{ Global.thread4.Start(); }
         }
@@ -60,6 +63,7 @@ namespace CTAutorun
                 else
                 {
                     Global.debug_log("Connected to robot");
+                    Global.thread4.Start();
                 }
             }
             catch (Exception ex)
@@ -70,6 +74,8 @@ namespace CTAutorun
             //Thread.Sleep(Timeout.Infinite);
 
         }
+
+
 
         private void CTAutorun_Load(object sender, EventArgs e)
         {
@@ -362,6 +368,25 @@ namespace CTAutorun
             }
         }
 
+        delegate void WriteRecievedRobotDataCallback(ushort data);
+
+        public void WriteRecievedRobotData(ushort data)
+        {
+            // InvokeRequired required compares the thread ID of the
+            // calling thread to the thread ID of the creating thread.
+            // If these threads are different, it returns true.
+            if (this.recivedDataFromRobotUpDown.InvokeRequired)
+            {
+                WriteRecievedRobotDataCallback d = new WriteRecievedRobotDataCallback(WriteRecievedRobotData);
+                this.Invoke(d, new object[] { data });
+            }
+            else
+            {
+                this.recivedDataFromRobotUpDown.Value = data;
+            }
+        }
+
+
         private void pause_button_Click(object sender, EventArgs e)
         {
             Global.AppPausedFlag = !Global.AppPausedFlag;
@@ -376,6 +401,17 @@ namespace CTAutorun
             stop_button.Enabled = false;
             pause_button.Enabled = false;
             startButton.Enabled = true;
+        }
+
+        private void sendStateToRobotButton_Click(object sender, EventArgs e)
+        {
+            Global.RobotDataToSend = (int)stateToSendToRobotUpDown.Value;
+            Global.shouldSendDataToRobot = true;
+        }
+
+        private void checkBox1_CheckedChanged(object sender, EventArgs e)
+        {
+            Global.checkBoxCheck = checkBox1.Checked;
         }
     }
 

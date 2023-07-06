@@ -14,7 +14,7 @@ using System.Windows.Automation;
 using System.Net.Sockets;
 using Modbus.Device;
 using System.Timers;
-using System.Runtime.CompilerServices;
+
 
 namespace CTAutorun
 {
@@ -54,7 +54,7 @@ public enum RobotState
     DOOR_CLOSED,
     REMOVING_ITEM,
     ITEM_REMOVED,
-    DONE
+    DONE = 100
 }
 
 public enum ProcessState
@@ -94,6 +94,8 @@ public static class Global
     public static ProcessState LastState = ProcessState.INACTIVE;
     public static ProcessState process = ProcessState.INACTIVE;
 
+    public static RobotState curr_state = RobotState.IDLE;
+
     public static string password = "dti1234";
     public static string AutoRunFile = "";
     public static bool SendData = false;
@@ -118,7 +120,16 @@ public static class Global
     public static string templatePath = @"C:\Users\fkl\source\repos\Bobot 2.0 App\Bobot 2.0 App\File\temp.arn";
     public static string robotCommunicationLogPath = @"C:\Users\fkl\source\repos\Bobot 2.0 App\Bobot 2.0 App\bin\Debug\RobotCommunication.log";
     public static string newFilePath = @"C:\Users\fkl\source\repos\Bobot 2.0 App\Bobot 2.0 App\File\test";
-    public static string appPath = @"C:\\Windows\\System32\\notepad.exe";//@"C:\Program Files\Zeiss\METROTOM OS\Bin\MetrotomOS.exe";//@"notepad.exe";//C:\Program Files\Notepad++\notepad++.exe";
+    public static string appPath = @"C:\Program Files\Zeiss\METROTOM OS\Bin\MetrotomOS.exe";//@"notepad.exe";//C:\Program Files\Notepad++\notepad++.exe";
+
+
+    public static int lastRobotDataSent = 0;
+    public static int RobotDataToSend = 0;
+    public static ushort lastRobotDataRecieved = 0;
+    public static bool shouldSendDataToRobot = false;
+
+
+    public static bool checkBoxCheck = false;
 
     private delegate void LogDelegate(string str);
     public static void debug_log(string msg)
@@ -127,20 +138,42 @@ public static class Global
         //debugLog.AppendText(msg + Environment.NewLine);
     }
 
+    public static void waitForCheckBoxChange()
+    {
+        // Get call stack
+        StackTrace stackTrace = new StackTrace();
+        // Get calling method name
+        StackFrame frame = stackTrace.GetFrame(1);
+        string caller = frame.GetMethod().Name;
+        int lineNum = frame.GetFileLineNumber();
+        bool initialValue = Global.checkBoxCheck;
+        Global.debug_log("Waiting for checkBox change, Caller: " + caller + "; Line: " + lineNum);
+        while (Global.checkBoxCheck == initialValue)
+        {
+            Thread.Sleep(500);
+        }
+    }
+
     public static void comms_test()
     {
-        if (Global.run_comm_test)
+        while (true)
         {
-
-            var old_state = Global.master.ReadHoldingRegisters(130, 1);
-            var robot_new_state = Global.master.ReadHoldingRegisters(128, 1);
-            if (robot_new_state[0] != old_state[0])
+            
+            var rr = Global.master.ReadHoldingRegisters(128, 1);
+            Global.lastRobotDataRecieved = rr[0];
+            Global.CTAutorun.WriteRecievedRobotData(rr[0]);
+            if (Global.run_comm_test)
             {
-                Global.master.WriteSingleRegister(130, robot_new_state[0]);
+                Global.master.WriteSingleRegister(130, rr[0]);
+            }
+            else if (Global.shouldSendDataToRobot)
+            {
+                Global.master.WriteSingleRegister(130, (ushort)Global.RobotDataToSend);
+                Global.shouldSendDataToRobot = false;
             }
 
+            Thread.Sleep(1000);
         }
-        Thread.Sleep(2000);
     }
 
     //public static void checkConnection()
@@ -269,11 +302,11 @@ public class StateMachine
             if (Global.ForceState)
             {
                 Global.process = Global.ForceNewState;
-                /*
+                
                 //switch (Global.ForceNewState)
                 //{
                 //    case ProcessState.Initialize:
-                //        Global.process.MoveNext(Command.ForceInit);
+                        //Global.process.MoveNext(Command.ForceInit);
 
                 //        break;
 
@@ -317,7 +350,7 @@ public class StateMachine
 
                 //        break;
                 //}
-                */
+                
                 Global.ForceState = false;
             }
 
@@ -329,11 +362,15 @@ public class StateMachine
                         ///
                         /// Initialize buttons
                         /// Launch and connect to program (METROMO?)
+                        /// 
+                        /// OBS: This is currently handled with the "Connect App" button insteaad of here
                         ///
                         // Connect or open app
+                        Global.waitForCheckBoxChange();
                         if(Global.app.ProcessId == 0)
                         {
                             Global.debug_log("Connect to app first");
+                            break;
                         }
                         //Global.app = UIauto.ConnectApp(Global.appPath);
                         Console.WriteLine(Global.app);
@@ -345,7 +382,36 @@ public class StateMachine
                         ///
                         /// Establish connection to robot via. MODBUS
                         ///
+                        try
+                        {
+                            //Attempt to create TCP/MODBUS connection to robot
+                            Global.client = new TcpClient("192.168.1.10", 502);
+                            Global.master = ModbusIpMaster.CreateIp(Global.client);
 
+                            //Write, then read register 130 to verify connection
+                            Global.master.WriteSingleRegister(130, (ushort)RobotState.DONE);
+                            var registers = Global.master.ReadHoldingRegisters(130, 1);
+                            if (registers == null)
+                            {
+                                Global.debug_log("Could not connect to robot");
+                            }
+                            else if (registers[0] != (ushort)RobotState.DONE)
+                            {
+                                Global.debug_log("Read " + registers[0] + " from robot, expected 100");
+                            }
+                            else
+                            {
+                                Global.debug_log("Connected to robot");
+                                //Connection succeded, start thread to monitor robot status
+                                Global.thread4.Start();
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Global.debug_log("Error connecting to robot: " + ex.Message);
+                            Global.process = ProcessState.STOP;
+                            break;
+                        }
 
 
                         Global.process = ProcessState.QUERY_ROBOT;
@@ -356,13 +422,45 @@ public class StateMachine
                         /// Query the robot for its current state and update local state to match
                         /// Stay in this state until the robot reports that it's done
                         ///
-                        Global.process = ProcessState.DISCONNECT_ROBOT; //| ProcessState.QUERY_ROBOT;
+                        Thread.Sleep(1000);
+
+                        //Read current robot status
+                        var rr = Global.master.ReadHoldingRegisters(128, 1);
+                        if(rr == null)
+                        {
+                            Global.debug_log("Failed to read state from robot, stopping statemachine");
+                            Global.process = ProcessState.STOP;
+                            break;
+                        }
+
+                        //Logging for debugging
+                        if (Global.curr_state != (RobotState)rr[0])
+                        {
+                            Global.debug_log("New robot state: " + ((RobotState)rr[0]).ToString());
+                            Global.curr_state = (RobotState)rr[0];
+                        }
+
+                        //If all elements have been proccesed, confirm 
+                        //TODO: why do we disconnect here? 
+                        if (Global.curr_state == RobotState.DONE)
+                        {
+                            Global.master.WriteSingleRegister(128, 0);
+                            Global.process = ProcessState.DISCONNECT_ROBOT;
+                            break;
+                        }
+
+                        Global.master.WriteSingleRegister(130, (ushort)Global.curr_state);
+
+                        Global.process = ProcessState.QUERY_ROBOT;
                         break;
 
                     case ProcessState.DISCONNECT_ROBOT:
                         ///
                         /// Close the current MODBUS connection to the robot
                         ///
+
+                        Global.client.Close();
+
                         Global.process = ProcessState.SELECT_TASK;
                         break;
 
@@ -374,7 +472,20 @@ public class StateMachine
                         /// and we can shutdown
                         ///
 
-                        Global.process = ProcessState.SCAN;//| ProcessState.STOP;
+                        UIauto.OpenNextTask(Global.app);
+                        Thread.Sleep(2000);
+
+                        Global.waitForCheckBoxChange();
+
+                        if (UIauto.TaskInspectorOpen(Global.app))
+                        {
+                            Global.process = ProcessState.SCAN;
+                            break;
+                        }
+
+                        //No task inspector = no more tasks
+                        Global.debug_log("Task queue is empty, exiting");
+                        Global.process = ProcessState.STOP;
                         break;
 
                     case ProcessState.SCAN:
@@ -382,6 +493,12 @@ public class StateMachine
                         /// Click the button to start the scan, then close the popup
                         /// dialog that appears
                         ///
+
+                        UIauto.ClickPlayButton(Global.app);
+                        Thread.Sleep(2000);
+                        UIauto.CloseDialog(Global.app, "Dialog", "OK");
+                        Thread.Sleep(1000);
+
                         Global.process = ProcessState.QUERY_FILES;
                         break;
 
@@ -391,7 +508,16 @@ public class StateMachine
                         /// Wait a bit, then close popup
                         ///
 
-                        Global.process = ProcessState.LOAD_TRAY;// | ProcessState.QUERY_FILES;
+                        if (UIauto.ScanStatus(Global.app) == "Ready")
+                        {
+                            Thread.Sleep(2000);
+                            UIauto.CloseDialog(Global.app, "Dialog", "OK");
+                            Global.process = ProcessState.LOAD_TRAY; 
+                            break;
+                        }
+
+                        //Scan not done, keep looping
+                        Global.process = ProcessState.QUERY_FILES;
                         break;
 
                     case ProcessState.LOAD_TRAY:
@@ -399,6 +525,18 @@ public class StateMachine
                         /// Set loader angle to 0
                         /// then click the load button
                         ///
+                        Global.debug_log("1");
+                        Global.waitForCheckBoxChange();
+                        Global.debug_log("2");
+                        UIauto.WriteLoaderAngle(Global.app);
+                        Global.debug_log("3");
+                        Global.waitForCheckBoxChange();
+                        Global.debug_log("4");
+                        Thread.Sleep(15000);
+                        Global.debug_log("5");
+                        UIauto.ClickLoadButton(Global.app);
+                        Global.debug_log("6");
+                        Global.waitForCheckBoxChange();
 
                         Global.process = ProcessState.CONNECT_ROBOT;
                         break;
@@ -407,6 +545,7 @@ public class StateMachine
                     ///
                     /// Ask for user confirmation, then commit suduko
                     ///
+                    //TODO: implement
 
                     default:
                         break;
@@ -436,7 +575,7 @@ public class UIauto
 
     public static FlaUI.Core.AutomationElements.AutomationElement dlg_menu, dlg_filer;
     public static string TestAppPath = @"notepad.exe";
-    public static bool testing = true;
+    public static bool testing = false;
 
     public static FlaUI.Core.Application ConnectApp(string path)
     {
@@ -446,7 +585,7 @@ public class UIauto
             Global.debug_log("attempting launch");
             //launches or attaches app
             var processStartInfo = new ProcessStartInfo(path);
-            var app = FlaUI.Core.Application.AttachOrLaunch(processStartInfo);
+            var app = FlaUI.Core.Application.Attach(path);
             if(app == null)
             {
                 throw new Exception("Could not attatch to application");
@@ -456,7 +595,6 @@ public class UIauto
             Global.debug_log("app launch success");
 
             return app;
-            //ProcessStartInfo startInfo = new ProcessStartInfo(path);
             //Process process = new Process();
             //process.StartInfo = startInfo;
             //process.Start();
@@ -465,6 +603,9 @@ public class UIauto
         catch (Exception e)
         {
             Global.debug_log(e.Message);
+            Global.debug_log(e.InnerException?.Message);
+            Global.debug_log(e.StackTrace);
+            Global.CTAutorun.Controls["ConnectApp"].Enabled = true;
             return null;
         }
 
@@ -473,23 +614,91 @@ public class UIauto
 
     public static FlaUI.Core.AutomationElements.AutomationElement GetChildByAutoID(FlaUI.Core.Application app, string autoId)
     {
-        Global.debug_log("1");
         try
         {
-            Global.debug_log("2");
             using (var automation = new UIA3Automation())
             {
-                Global.debug_log("3");
-                ConditionFactory cf = new ConditionFactory(new UIA3PropertyLibrary());
+                //ConditionFactory cf = new ConditionFactory(new UIA3PropertyLibrary());
                 var window = app.GetMainWindow(automation, TimeSpan.FromSeconds(timeout));
                 if (window != null)
                 {
-                    Global.debug_log(window.Name);
-                    foreach (var item in window.FindAllChildren())
+                    //Global.debug_log(window.Name);
+                    AutomationElement result = null;
+                    if (window.AutomationId == autoId)
                     {
-                        Global.debug_log("    " + item.Name);
+                        result = window;
+                        return result;
                     }
-                    return window.FindFirstDescendant(cf.ByAutomationId(autoId));
+                    return null;
+                    //else
+                    //{
+                    //    foreach (var item in window.FindAllDescendants())
+                    //    {
+                    //        if (item.AutomationId.Any() && item.AutomationId == autoId)
+                    //        {
+                    //            result = item;
+                    //            break;
+                    //        }
+                    //    }
+                    //}
+                    //return result;
+                }
+                else
+                {
+                    Global.debug_log("Could not get window");
+                    FlaUI.Core.AutomationElements.AutomationElement temp = null;
+                    return temp;
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            Global.debug_log(e.Message);
+            return null; 
+        }
+    }
+
+    public static FlaUI.Core.AutomationElements.AutomationElement GetChildByAutoID(AutomationElement root, string autoId, int depth = 0)
+    {
+
+        try
+        {
+            using (var automation = new UIA3Automation())
+            {
+                if (root != null)
+                {
+                    //Global.debug_log(window.Name);
+                    AutomationElement result = null;
+                    if (root.AutomationId == autoId)
+                    {
+                        //Global.debug_log("Found element, was root");
+                        result = root;
+                    }
+                    else
+                    {
+                        AutomationElement rec = null;
+                        foreach (AutomationElement item in root.FindAllChildren())
+                        {
+                            if (item.AutomationId.Any() && item.AutomationId == autoId)
+                            {
+                                //Global.debug_log("Found element, was child");
+                                result = item;
+                                break;
+                            }
+                            if(depth > 0)
+                            {
+                                rec = GetChildByAutoID(item, autoId, depth-1);
+                                if (rec != null)
+                                {
+                                    result = rec;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+
+                    return result;
 
                 }
                 else
@@ -502,9 +711,8 @@ public class UIauto
         }
         catch (Exception e)
         {
-            Global.debug_log("4");
             Global.debug_log(e.Message);
-            return null; 
+            return null;
         }
     }
 
@@ -545,6 +753,7 @@ public class UIauto
                 //x = x + window.BoundingRectangle.X;
                 //y = y + window.BoundingRectangle.Y;
                 FlaUI.Core.Input.Mouse.Position = new System.Drawing.Point(x, y);//MoveTo(x, y);
+                Global.waitForCheckBoxChange();
                 FlaUI.Core.Input.Mouse.Click();
             }
         }
@@ -562,6 +771,7 @@ public class UIauto
                 x = x + window.BoundingRectangle.X;
                 y = y + window.BoundingRectangle.Y;
                 Mouse.MoveTo(x, y);
+                Global.waitForCheckBoxChange();
                 Mouse.DoubleClick();
             }
         }
@@ -609,12 +819,12 @@ public class UIauto
     //Not Done - FKL
     public static string ScanStatus(FlaUI.Core.Application app)
     {
-        dlg_status = GetChildByAutoID(app, "statusStrip1").AsProgressBar();
+        //dlg_status = GetChildByAutoID(app, "statusStrip1").AsProgressBar();
 
         if (dlg_status != null)
         {
             SetFocus(app);
-            return dlg_status.ToString(); // Not Done - FKL
+            return dlg_status.FindChildAt(0).Name; // Not Done - FKL
         }
         else
         {
@@ -625,7 +835,7 @@ public class UIauto
     public static bool ClickLoadButton(FlaUI.Core.Application app)
     {
         SetFocus(app);
-        dlg_pos_sys = GetChildByAutoID(app, "bbMachine");
+        //dlg_pos_sys = GetChildByAutoID(app, "bbMachine");
 
         if (dlg_pos_sys != null)
         {
@@ -649,7 +859,7 @@ public class UIauto
     public static bool OpenNextTask(FlaUI.Core.Application app)
     {
         SetFocus(app);
-        dlg_task = GetChildByAutoID(app, "tvMainTree");
+        //dlg_task = GetChildByAutoID(app, "tvMainTree");
 
         if (dlg_task != null)
         {
@@ -703,19 +913,22 @@ public class UIauto
         SetFocus(app);
         dlg_inspector = GetChildByAutoID(app, "CTInspector");
 
-        if (dlg_inspector != null)
+        if (dlg_inspector == null)
         {
             return false;
 
         }
-        else { return true; }
+        else 
+        { 
+            return true; 
+        }
 
     }
 
     public static bool WriteLoaderAngle(FlaUI.Core.Application app)
     {
         SetFocus(app);
-        dlg_angle = GetChildByAutoID(app, "nudAngle");
+        //dlg_angle = GetChildByAutoID(app, "nudAngle");
 
         if (dlg_angle != null)
         {
@@ -766,7 +979,11 @@ public class UIauto
             }
             Global.debug_log("Found menubar");
             ConditionFactory cf = new ConditionFactory(new UIA3PropertyLibrary());
-            dlg_filer = dlg_menu.FindFirstChild(cf.ByName("Filer"));
+            foreach (var item in dlg_menu.FindAllChildren())
+            {
+                Global.debug_log("    " + item.Name);
+            }
+            dlg_filer = dlg_menu.FindFirstChild(cf.ByName("File"));
             if (dlg_filer == null)
             {
                 Global.debug_log("Could not find File");
@@ -782,41 +999,90 @@ public class UIauto
         {
             Global.debug_log("launching metrotom");
             FlaUI.Core.Application app = ConnectApp(Global.appPath);
+            
             if(app == null)
             {
                 Global.CTAutorun.Controls["ConnectApp"].Enabled = true;
                 return;
             }
-            SetFocus(app);
+            Global.app = app;
+            //SetFocus(app);
             Global.debug_log("finding children");
+
+            //w: METROTOM OS 2.6.13032.1
             dlg_metro = GetChildByAutoID(app, "MainForm");
             if(dlg_metro == null)
             {
                 Global.debug_log("Could not find MainForm");
                 return;
             }
-            
-            dlg_sess = GetChildByAutoID(app, "DockingMainWnd");
+            Global.debug_log("Found MainForm");
+
+            //w: METROTOM OS 2.6.13032.1 - 32bit -> p: -> w: METROTOM Session
+            dlg_sess = GetChildByAutoID(dlg_metro, "DockingMainWnd", 1);
             if( dlg_sess == null)
             {
                 Global.debug_log("Could not find DockingMainWnd");
                 return;
             }
-            
-            dlg_ctrl = GetChildByAutoID(app, "uipControlPanel");
+            Global.debug_log("Found DockingMainWnd");
+
+            //w: METROTOM OS 2.6.13032.1 - 32bit -> p: -> w: METROTOM Session -> p: Control Panel
+            dlg_ctrl = GetChildByAutoID(dlg_sess, "uipControlPanel");
             if(dlg_ctrl == null)
             {
                 Global.debug_log("Could not find uipControlPanel");
                 return;
             }
-            
-            dlg_explorer = GetChildByAutoID(app, "uipSessionExplorer");
+            Global.debug_log("Found uipControlPanel");
+
+            //w: METROTOM OS 2.6.13032.1 - 32bit -> p: -> w: METROTOM Session -> p: Session Explorer
+            dlg_explorer = GetChildByAutoID(dlg_sess, "uipSessionExplorer");
             if(dlg_explorer == null)
             {
                 Global.debug_log("Could not find uipSessionExplorer");
                 return;
             }
-            
+            Global.debug_log("Found uipSessionExplorer");
+
+            //w: METROTOM OS 2.6.13032.1 - 32bit -> p: -> w: METROTOM Session -> p: statusStrip1
+            dlg_status = GetChildByAutoID(dlg_sess, "statusStrip1");
+            if (dlg_status == null)
+            {
+                Global.debug_log("Could not find statusStrip1");
+                return;
+            }
+            Global.debug_log("Found statusStrip1");
+
+            //w: METROTOM OS 2.6.13032.1 - 32bit -> p: -> w: METROTOM Session -> p: Control Panel -> p: -> p: -> p: -> s: mm
+            dlg_angle = GetChildByAutoID(dlg_ctrl, "nudAngle", 3);
+            if (dlg_angle == null)
+            {
+                Global.debug_log("Could not find statusStrip1");
+                return;
+            }
+            Global.debug_log("Found nudAngle");
+
+            //w: METROTOM OS 2.6.13032.1 - 32bit -> p: -> w: METROTOM Session -> p: Control Panel -> p: -> p: -> p: -> p: buttonBar1
+            dlg_pos_sys = GetChildByAutoID(dlg_ctrl, "bbMachine", 3);
+            if (dlg_pos_sys == null)
+            {
+                Global.debug_log("Could not find bbMachine");
+                return;
+            }
+            Global.debug_log("Found bbMachine");
+
+            //w: METROTOM OS 2.6.13032.1 - 32bit -> p: -> w: METROTOM Session -> p: Session Explorer -> p: -> p: 
+            dlg_task = GetChildByAutoID(dlg_explorer, "tvMainTree", 1);
+            if (dlg_task == null)
+            {
+                Global.debug_log("Could not find tvMainTree");
+                return;
+            }
+            Global.debug_log("Found tvMainTree");
+
+
+
 
             var status = ScanStatus(app);
             Global.debug_log("Status: " + status);
